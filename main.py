@@ -1,25 +1,31 @@
 import asyncio
-import os
-from core.bot import GameEngine
-from config import Config
+import sys
 from dotenv import load_dotenv
+from config import Config
+from core.bot import GameEngine
 
 load_dotenv()
 
-async def main():
-    # Initialize the Config class from config.py
+
+async def main() -> None:
     config = Config()
-    
-    if not config.TOKEN:
-        print("❌ ERROR: No Token found in .env or Config!")
-        return
+
+    if not config.validate():
+        print("❌ ERROR: No TOKEN found. Set it in .env or Replit Secrets.")
+        sys.exit(1)
 
     bot = GameEngine(config)
-    async with bot:
-        await bot.start(config.TOKEN)
+
+    try:
+        async with bot:
+            await bot.start(config.TOKEN)
+    except Exception as e:
+        print(f"❌ Fatal error: {e}")
+        raise
+
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("Shutting down...")
+        print("\n⚡ Shutdown requested. Goodbye.")

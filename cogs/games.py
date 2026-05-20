@@ -1,86 +1,158 @@
+from __future__ import annotations
+
+import datetime
+import random
 import discord
 from discord.ext import commands
-import random
-import re
+
+from core.utils import (
+    parse_amount,
+    check_cooldown,
+    set_cooldown,
+    is_processing,
+    set_processing,
+    clear_processing,
+)
+
 
 class Games(commands.Cog):
-    def __init__(self, bot):
+    def __init__(self, bot) -> None:
         self.bot = bot
 
-    def parse_amount(self, amount_str, balance):
-        """Helper to convert 1k, 0.5k, etc., into integers."""
-        amount_str = amount_str.lower().strip()
-        if amount_str == "all":
-            return balance
-        
-        # Regex to find numbers and the 'k' suffix
-        match = re.match(r"([\d.]+)([k]?)", amount_str)
-        if not match:
-            return None
-        
-        num, suffix = match.groups()
-        try:
-            val = float(num)
-            if suffix == "k":
-                val *= 1000
-            return int(val)
-        except ValueError:
-            return None
+    # ── Coinflip ──────────────────────────────────────────────────────────────
 
-    @commands.command(name="cf", aliases=["coinflip"])
-    async def coinflip(self, ctx, amount: str, side: str = None):
-        """Usage: go cf <amount> <heads/tails>"""
-        
-        # 1. Validation: Basic checks
-        if side is None or side.lower() not in ["heads", "tails", "h", "t"]:
+    @commands.command(name="cf", aliases=["coinflip", "flip"])
+    async def coinflip(self, ctx, amount: str, side: str = None) -> None:
+        """Flip a coin for coins. Usage: go cf <amount> <heads/tails>"""
+        uid = ctx.author.id
+        max_bet = self.bot.cfg.MAX_BET
+        cooldown = self.bot.cfg.CF_COOLDOWN
+
+        # Anti-duplicate lock
+        if is_processing(uid, "cf"):
+            return await ctx.send(
+                "⏳ Your previous flip is still being processed!", delete_after=5
+            )
+
+        # Rate limit
+        remaining = check_cooldown(uid, "cf", cooldown)
+        if remaining > 0:
+            return await ctx.send(
+                f"⏱️ Please wait **{remaining:.1f}s** before flipping again.",
+                delete_after=5,
+            )
+
+        # Side validation
+        if not side or side.lower() not in ("heads", "tails", "h", "t"):
             return await ctx.send("❌ Usage: `go cf <amount> <heads/tails>`")
-        
-        # Normalize side
-        user_choice = "heads" if side.lower() in ["heads", "h"] else "tails"
 
-        # 2. Get Balance & Parse Bet
-        async with self.bot.db.execute("SELECT balance FROM players WHERE uid = ?", (ctx.author.id,)) as cursor:
-            row = await cursor.fetchone()
-            current_balance = row[0] if row else 0
+        user_choice = "heads" if side.lower() in ("heads", "h") else "tails"
 
-        bet = self.parse_amount(amount, current_balance)
+        # Fetch balance
+        async with self.bot.dbs.players.execute(
+            "SELECT balance FROM players WHERE uid = ?", (uid,)
+        ) as cur:
+            row = await cur.fetchone()
 
+        if not row:
+            return await ctx.send("❌ Account not found.")
+
+        current_balance = row[0]
+
+        # Parse amount
+        bet = parse_amount(amount, current_balance)
         if bet is None:
-            return await ctx.send("❌ Please enter a valid number (e.g., 100, 1.5k, all).")
-
+            return await ctx.send(
+                "❌ Invalid amount. Try a number, `1k`, `2.5k`, `all`, or `half`."
+            )
         if bet <= 0:
-            return await ctx.send("❌ You can't bet nothing!")
-        
-        # 3. Maximum Bet Logic (300k)
-        if bet > 300000:
-            return await ctx.send("❌ The maximum bet is **💰 300,000** coins!")
-        
+            return await ctx.send("❌ Bet must be greater than zero.")
+        if bet > max_bet:
+            return await ctx.send(
+                f"❌ Maximum bet is `🪙 {max_bet:,}`."
+            )
         if bet > current_balance:
-            return await ctx.send(f"❌ You don't have enough coins! Balance: **{current_balance}**")
+            return await ctx.send(
+                f"❌ Insufficient balance. You have `🪙 {current_balance:,}`."
+            )
 
-        # 4. The Game Logic
-        result = random.choice(["heads", "tails"])
-        win = user_choice == result
-        
-        if win:
-            new_balance = current_balance + bet
-            status = "💎 STATUS: **FILTHY RICH**"
-            outcome_text = f"**💰 WIN!** | **{ctx.author.name}** picked **{user_choice}** and doubled their **{bet:,}**!"
-            color = discord.Color.green()
-        else:
-            new_balance = current_balance - bet
-            status = "📉 STATUS: **DOWN BAD**"
-            outcome_text = f"**💔 LOST** | **{ctx.author.name}** picked **{user_choice}** and lost **{bet:,}**."
-            color = discord.Color.red()
+        # Lock + set cooldown
+        set_processing(uid, "cf")
+        set_cooldown(uid, "cf")
 
-        # 5. Update Database
-        await self.bot.db.execute("UPDATE players SET balance = ? WHERE uid = ?", (new_balance, ctx.author.id))
-        await self.bot.db.commit()
+        try:
+            result = random.choice(("heads", "tails"))
+            won = user_choice == result
+            profit = bet if won else -bet
+            new_balance = current_balance + profit
+            now = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
-        # 6. Response (Option C Style)
-        embed = discord.Embed(description=f"{outcome_text}\n{status}", color=color)
-        embed.set_footer(text=f"New Balance: {new_balance:,}")
-        await ctx.send(embed=embed)
+            # Atomic stat update
+            await self.bot.dbs.players.execute(
+                """UPDATE players SET
+                       balance       = ?,
+                       total_games   = total_games   + 1,
+                       total_wins    = total_wins    + ?,
+                       total_losses  = total_losses  + ?,
+                       total_wagered = total_wagered + ?,
+                       total_profit  = total_profit  + ?
+                   WHERE uid = ?""",
+                (
+                    new_balance,
+                    1 if won else 0,
+                    0 if won else 1,
+                    bet,
+                    profit,
+                    uid,
+                ),
+            )
+            await self.bot.dbs.players.commit()
 
-async def setup(bot):
+            # Transaction log
+            await self.bot.dbs.economy.execute(
+                "INSERT INTO transactions (uid, game, bet, profit, timestamp) VALUES (?, ?, ?, ?, ?)",
+                (uid, "coinflip", bet, profit, now),
+            )
+            await self.bot.dbs.economy.commit()
+
+            # Update username in case it changed
+            await self.bot.dbs.players.execute(
+                "UPDATE players SET username = ? WHERE uid = ?",
+                (str(ctx.author), uid),
+            )
+            await self.bot.dbs.players.commit()
+
+            # Build embed response
+            if won:
+                color = discord.Color.green()
+                title = "💎 WIN!"
+                desc = (
+                    f"**{ctx.author.display_name}** picked **{user_choice}** "
+                    f"— coin landed **{result}**!\n💵 STATUS: **FILTHY RICH**"
+                )
+            else:
+                color = discord.Color.red()
+                title = "💔 LOST"
+                desc = (
+                    f"**{ctx.author.display_name}** picked **{user_choice}** "
+                    f"— coin landed **{result}**.\n📉 STATUS: **DOWN BAD**"
+                )
+
+            sign = "+" if won else "-"
+            embed = discord.Embed(title=title, description=desc, color=color)
+            embed.add_field(name="Bet",         value=f"`🪙 {bet:,}`",               inline=True)
+            embed.add_field(name="Result",      value=f"`{sign}🪙 {bet:,}`",         inline=True)
+            embed.add_field(name="New Balance", value=f"`🪙 {new_balance:,}`",       inline=True)
+            embed.set_footer(text="Goldie Economy • go profit for daily stats")
+
+            await ctx.send(embed=embed)
+
+        except Exception as exc:
+            print(f"[coinflip error] {exc}")
+            await ctx.send("❌ Something went wrong. Please try again.", delete_after=8)
+        finally:
+            clear_processing(uid, "cf")
+
+
+async def setup(bot) -> None:
     await bot.add_cog(Games(bot))

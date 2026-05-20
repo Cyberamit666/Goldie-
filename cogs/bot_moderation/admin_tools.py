@@ -1,264 +1,490 @@
-import discord
-import datetime
+from __future__ import annotations
 
-# ==================== APPEAL SYSTEM ====================
+import datetime
+import discord
+
+from core.utils import win_rate, fmt_signed
+
+
+# ── Appeal system ─────────────────────────────────────────────────────────────
 
 class AppealView(discord.ui.View):
-    def __init__(self, bot, target_id: int):
+    def __init__(self, bot, target_id: int) -> None:
         super().__init__(timeout=None)
         self.bot = bot
         self.target_id = target_id
 
-    @discord.ui.button(label="Submit Unban Application", style=discord.ButtonStyle.blurple, custom_id="appeal_unban")
-    async def appeal(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # Check if already submitted
-        async with self.bot.db.execute("SELECT 1 FROM ban_appeals WHERE uid = ?", (self.target_id,)) as cursor:
-            if await cursor.fetchone():
-                return await interaction.response.send_message("<:emoji_26:1504070583145594942> You have already submitted an appeal. Please wait for staff review.", ephemeral=True)
-
+    @discord.ui.button(
+        label="📝 Submit Unban Appeal",
+        style=discord.ButtonStyle.blurple,
+        custom_id="goldie_appeal_v2",
+    )
+    async def appeal(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        async with self.bot.dbs.bans.execute(
+            "SELECT 1 FROM ban_appeals WHERE uid = ? AND status = 'pending'",
+            (self.target_id,),
+        ) as cur:
+            if await cur.fetchone():
+                return await interaction.response.send_message(
+                    "⚠️ You already have a pending appeal. Please wait for staff review.",
+                    ephemeral=True,
+                )
         await interaction.response.send_modal(AppealModal(self.bot, self.target_id))
 
 
-class AppealModal(discord.ui.Modal, title="Unban Application"):
-    description = discord.ui.TextInput(
-        label="<:emoji_22:1503659968296124536>Your Appeal Reason",
-        placeholder="<:emoji_22:1503659968296124536>Explain why you should be unbanned...",
+class AppealModal(discord.ui.Modal, title="Unban Appeal"):
+    reason = discord.ui.TextInput(
+        label="Appeal Reason",
+        placeholder="Explain why you should be unbanned…",
         style=discord.TextStyle.paragraph,
         required=True,
-        max_length=1000
+        max_length=1000,
     )
 
-    def __init__(self, bot, target_id: int):
+    def __init__(self, bot, target_id: int) -> None:
         super().__init__()
         self.bot = bot
         self.target_id = target_id
 
-    async def on_submit(self, interaction: discord.Interaction):
-        # Save appeal
-        await self.bot.db.execute(
-            "INSERT INTO ban_appeals (uid, reason, appeal_time) VALUES (?, ?, ?)",
-            (self.target_id, self.description.value, datetime.datetime.now(datetime.timezone.utc).isoformat())
-        )
-        await self.bot.db.commit()
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        now = datetime.datetime.now(datetime.timezone.utc)
 
-        # Send to staff channel
-        channel_id = getattr(self.bot, 'appeal_channel_id', None)
-        if channel_id:
-            channel = self.bot.get_channel(channel_id)
+        await self.bot.dbs.bans.execute(
+            "INSERT INTO ban_appeals (uid, reason, appeal_time, status) VALUES (?, ?, ?, 'pending')",
+            (self.target_id, self.reason.value, now.isoformat()),
+        )
+        await self.bot.dbs.bans.commit()
+
+        # Notify staff channel
+        ch_id = getattr(self.bot, "appeal_channel_id", None)
+        if ch_id:
+            channel = self.bot.get_channel(ch_id)
             if channel:
                 embed = discord.Embed(
                     title="🔔 New Ban Appeal",
                     color=discord.Color.orange(),
-                    timestamp=datetime.datetime.now(datetime.timezone.utc)
+                    timestamp=now,
                 )
-                embed.add_field(name="User ID", value=f"`{self.target_id}`", inline=True)
-                embed.add_field(name="Submitted By", value=f"{interaction.user} ({interaction.user.id})", inline=True)
-                embed.add_field(name="Reason", value=self.description.value, inline=False)
-                await channel.send(embed=embed)
+                embed.add_field(name="User ID",     value=f"`{self.target_id}`",                                    inline=True)
+                embed.add_field(name="Submitted By", value=f"{interaction.user} (`{interaction.user.id}`)", inline=True)
+                embed.add_field(name="Reason",       value=self.reason.value,                                       inline=False)
+                view = AppealActionView(self.bot, self.target_id)
+                await channel.send(embed=embed, view=view)
 
         await interaction.response.send_message(
-            "✅ Your appeal has been submitted successfully!\nStaff will review it shortly.",
-            ephemeral=True
+            "✅ Your appeal has been submitted. Staff will review it shortly.",
+            ephemeral=True,
         )
 
 
-# ==================== MANAGEMENT VIEWS ====================
+class AppealActionView(discord.ui.View):
+    """Sent to staff channel so they can approve/deny without typing commands."""
 
-class ManagementDropdown(discord.ui.Select):
-    def __init__(self, target_id, bot):
-        self.target_id = target_id
+    def __init__(self, bot, target_id: int) -> None:
+        super().__init__(timeout=None)
         self.bot = bot
-        options = [
-            discord.SelectOption(label="Security & Bans", description="Toggle bot access for this user.", emoji="🛡️", value="ban_menu"),
-            discord.SelectOption(label="Profile Analytics", description="View detailed user metadata.", emoji="📊", value="stats"),
-        ]
-        super().__init__(placeholder="Choose a management category...", min_values=1, max_values=1, options=options)
-
-    async def callback(self, interaction: discord.Interaction):
-        if self.values[0] == "ban_menu":
-            async with self.bot.db.execute("SELECT 1 FROM players_ban WHERE uid = ?", (self.target_id,)) as cursor:
-                is_banned = bool(await cursor.fetchone())
-            
-            view = MoreOptionsView(self.target_id, self.bot, self.view.parent_view, is_banned)
-            await interaction.response.edit_message(content="### 🛡️ Security Management\nSelect an action below:", view=view)
-        else:
-            await interaction.response.send_message("📊 Analytic functions coming soon!", ephemeral=True)
-
-
-class BanReasonModal(discord.ui.Modal, title="Specify Ban Reason"):
-    reason = discord.ui.TextInput(
-        label="<:emoji_22:1503659968296124536>Reason for Ban", 
-        placeholder="e.g. Exploiting economy glitches...",
-        style=discord.TextStyle.paragraph,
-        required=True
-    )
-
-    def __init__(self, target_id, bot, parent_view):
-        super().__init__()
         self.target_id = target_id
-        self.bot = bot
-        self.parent_view = parent_view
 
-    async def on_submit(self, interaction: discord.Interaction):
-        # Ban user
-        await self.bot.db.execute("INSERT OR IGNORE INTO players_ban (uid) VALUES (?)", (self.target_id,))
-        await self.bot.db.commit()
+    @discord.ui.button(label="✅ Approve", style=discord.ButtonStyle.success)
+    async def approve(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.bot.dbs.bans.execute("DELETE FROM bans WHERE uid = ?", (self.target_id,))
+        await self.bot.dbs.bans.execute(
+            "UPDATE ban_appeals SET status='approved' WHERE uid = ? AND status='pending'",
+            (self.target_id,),
+        )
+        await self.bot.dbs.bans.commit()
 
         try:
             user = await self.bot.fetch_user(self.target_id)
-            dm_embed = discord.Embed(
+            dm = discord.Embed(
+                title="✅ Ban Appeal Approved",
+                description="Your appeal has been reviewed and approved. You may now use the bot again.",
+                color=discord.Color.green(),
+            )
+            await user.send(embed=dm)
+        except Exception:
+            pass
+
+        await interaction.response.send_message(
+            f"✅ User `{self.target_id}` has been unbanned and notified.", ephemeral=True
+        )
+        for item in self.children:
+            item.disabled = True
+        await interaction.edit_original_response(view=self)
+
+    @discord.ui.button(label="❌ Deny", style=discord.ButtonStyle.danger)
+    async def deny(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.bot.dbs.bans.execute(
+            "UPDATE ban_appeals SET status='denied' WHERE uid = ? AND status='pending'",
+            (self.target_id,),
+        )
+        await self.bot.dbs.bans.commit()
+
+        try:
+            user = await self.bot.fetch_user(self.target_id)
+            dm = discord.Embed(
+                title="❌ Ban Appeal Denied",
+                description="Your appeal has been reviewed and denied. The ban remains in place.",
+                color=discord.Color.red(),
+            )
+            await user.send(embed=dm)
+        except Exception:
+            pass
+
+        await interaction.response.send_message(
+            f"❌ Appeal for `{self.target_id}` has been denied.", ephemeral=True
+        )
+        for item in self.children:
+            item.disabled = True
+        await interaction.edit_original_response(view=self)
+
+
+# ── Ban management modals / views ─────────────────────────────────────────────
+
+class BanReasonModal(discord.ui.Modal, title="Specify Ban Reason"):
+    reason = discord.ui.TextInput(
+        label="Reason for Ban",
+        placeholder="e.g. Exploiting economy glitches…",
+        style=discord.TextStyle.paragraph,
+        required=True,
+    )
+
+    def __init__(self, bot, target_id: int, refresh_view) -> None:
+        super().__init__()
+        self.bot = bot
+        self.target_id = target_id
+        self.refresh_view = refresh_view
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+        await self.bot.dbs.bans.execute(
+            "INSERT OR REPLACE INTO bans (uid, reason, banned_by, banned_at) VALUES (?, ?, ?, ?)",
+            (self.target_id, self.reason.value, interaction.user.id, now),
+        )
+        await self.bot.dbs.bans.commit()
+
+        # Remove from verified cache
+        self.bot.accepted_cache.discard(self.target_id)
+
+        # DM the banned user
+        try:
+            user = await self.bot.fetch_user(self.target_id)
+            dm = discord.Embed(
                 title="⛔ Bot Ban Notice",
                 description=(
-                    f"You have been banned from the bot system.\n\n"
+                    "You have been **banned** from the Goldie economy bot.\n\n"
                     f"**Reason:** {self.reason.value}\n\n"
-                    "If you believe this is a mistake, you can use the button below to apply for an unban."
+                    "If you believe this is a mistake, click the button below to appeal."
                 ),
                 color=discord.Color.red(),
-                timestamp=datetime.datetime.now(datetime.timezone.utc)
+                timestamp=datetime.datetime.now(datetime.timezone.utc),
             )
-            await user.send(embed=dm_embed, view=AppealView(self.bot, self.target_id))
-        except:
+            await user.send(embed=dm, view=AppealView(self.bot, self.target_id))
+        except Exception:
             pass
 
-        # Optional server ban
+        # Optional guild ban
         try:
-            guild_user = await interaction.guild.fetch_member(self.target_id)
-            if guild_user:
-                await interaction.guild.ban(guild_user, reason=f"Bot-ban by {interaction.user}: {self.reason.value}")
-        except:
+            member = await interaction.guild.fetch_member(self.target_id)
+            if member:
+                await interaction.guild.ban(
+                    member,
+                    reason=f"Bot-ban by {interaction.user}: {self.reason.value}",
+                )
+        except Exception:
             pass
 
-        await interaction.response.send_message(f"✅ User `{self.target_id}` has been banned and notified.", ephemeral=True)
-        
-        # Refresh view
-        new_view = MoreOptionsView(self.target_id, self.bot, self.parent_view, is_banned=True)
-        await interaction.edit_original_response(view=new_view)
-
-
-class MoreOptionsView(discord.ui.View):
-    def __init__(self, target_id, bot, parent_view, is_banned=False):
-        super().__init__(timeout=60)
-        self.target_id = target_id
-        self.bot = bot
-        self.parent_view = parent_view
-        self.is_banned = is_banned
-
-        # Button is now properly defined in __init__
-        self.toggle_ban_button = discord.ui.Button(
-            label="Unban from Bot" if is_banned else "Ban from Bot",
-            style=discord.ButtonStyle.success if is_banned else discord.ButtonStyle.danger
+        await interaction.response.send_message(
+            f"✅ User `{self.target_id}` has been banned and notified.", ephemeral=True
         )
-        self.toggle_ban_button.callback = self.toggle_ban
-        self.add_item(self.toggle_ban_button)
-
-        # Back button
-        back_button = discord.ui.Button(label="Back", style=discord.ButtonStyle.gray)
-        back_button.callback = self.back_button
-        self.add_item(back_button)
-
-    async def toggle_ban(self, interaction: discord.Interaction):
-        async with self.bot.db.execute("SELECT 1 FROM players_ban WHERE uid = ?", (self.target_id,)) as cursor:
-            already_banned = bool(await cursor.fetchone())
-
-        if already_banned:
-            # Unban
-            await self.bot.db.execute("DELETE FROM players_ban WHERE uid = ?", (self.target_id,))
-            await self.bot.db.commit()
-            await interaction.response.send_message("✅ User has been **Unbanned** from the bot.", ephemeral=True)
-            
-            new_view = MoreOptionsView(self.target_id, self.bot, self.parent_view, is_banned=False)
-            await interaction.edit_original_response(view=new_view)
-        else:
-            # Ban
-            await interaction.response.send_modal(BanReasonModal(self.target_id, self.bot, self.parent_view))
-
-    async def back_button(self, interaction: discord.Interaction):
-        await interaction.response.edit_message(content=None, view=self.parent_view)
-
-
-class PlayerManagementView(discord.ui.View):
-    def __init__(self, target_id, bot):
-        super().__init__(timeout=60)
-        self.target_id = target_id
-        self.bot = bot
-
-    @discord.ui.button(label="Set Balance", style=discord.ButtonStyle.secondary)
-    async def set_bal(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(SetBalanceModal(self.target_id, self.bot))
-
-    @discord.ui.button(label="Remove User", style=discord.ButtonStyle.danger)
-    async def remove_user(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.bot.db.execute("DELETE FROM players WHERE uid = ?", (self.target_id,))
-        await self.bot.db.commit()
-        if self.target_id in getattr(self.bot, 'accepted_cache', set()):
-            self.bot.accepted_cache.discard(self.target_id)
-        await interaction.response.edit_message(content=f"✅ Player `{self.target_id}` has been removed.", embed=None, view=None)
-
-    @discord.ui.button(label="More...", style=discord.ButtonStyle.gray)
-    async def more_options(self, interaction: discord.Interaction, button: discord.ui.Button):
-        view = discord.ui.View(timeout=60)
-        view.parent_view = self
-        view.add_item(ManagementDropdown(self.target_id, self.bot))
-        
-        back = discord.ui.Button(label="Back", style=discord.ButtonStyle.gray)
-        async def back_callback(inter):
-            await inter.response.edit_message(view=self)
-        back.callback = back_callback
-        view.add_item(back)
-
-        await interaction.response.edit_message(view=view)
 
 
 class SetBalanceModal(discord.ui.Modal, title="Update Player Balance"):
-    amount = discord.ui.TextInput(label="New Balance", placeholder="Enter numeric value...", required=True)
+    amount = discord.ui.TextInput(
+        label="New Balance",
+        placeholder="Enter a numeric value…",
+        required=True,
+    )
 
-    def __init__(self, target_id, bot):
+    def __init__(self, bot, target_id: int) -> None:
         super().__init__()
-        self.target_id = target_id
         self.bot = bot
+        self.target_id = target_id
 
-    async def on_submit(self, interaction: discord.Interaction):
+    async def on_submit(self, interaction: discord.Interaction) -> None:
         try:
-            new_bal = int(self.amount.value)
-            await self.bot.db.execute("UPDATE players SET balance = ? WHERE uid = ?", (new_bal, self.target_id))
-            await self.bot.db.commit()
-            await interaction.response.send_message(f"✅ Updated balance to `{new_bal:,}`", ephemeral=True)
+            new_bal = int(self.amount.value.replace(",", ""))
+            if new_bal < 0:
+                raise ValueError
         except ValueError:
-            await interaction.response.send_message("<:emoji_26:1504070583145594942> Error: Balance must be a number.", ephemeral=True)
+            return await interaction.response.send_message(
+                "❌ Balance must be a non-negative integer.", ephemeral=True
+            )
+
+        await self.bot.dbs.players.execute(
+            "UPDATE players SET balance = ? WHERE uid = ?",
+            (new_bal, self.target_id),
+        )
+        await self.bot.dbs.players.commit()
+        await interaction.response.send_message(
+            f"✅ Balance updated to `🪙 {new_bal:,}`.", ephemeral=True
+        )
 
 
-# Keep your existing execute_player_search function (unchanged)
-async def execute_player_search(ctx, uid: int):
-    async with ctx.bot.db.execute("SELECT balance, accepted FROM players WHERE uid = ?", (uid,)) as cursor:
-        row = await cursor.fetchone()
+class SecurityView(discord.ui.View):
+    """Ban / unban sub-panel reached from PlayerManagementView."""
+
+    def __init__(self, bot, target_id: int, is_banned: bool, back_view) -> None:
+        super().__init__(timeout=60)
+        self.bot = bot
+        self.target_id = target_id
+        self.is_banned = is_banned
+        self.back_view = back_view
+        self._build()
+
+    def _build(self) -> None:
+        self.clear_items()
+
+        toggle = discord.ui.Button(
+            label="Unban from Bot" if self.is_banned else "Ban from Bot",
+            style=discord.ButtonStyle.success if self.is_banned else discord.ButtonStyle.danger,
+        )
+        toggle.callback = self._toggle_ban
+        self.add_item(toggle)
+
+        back = discord.ui.Button(label="◀ Back", style=discord.ButtonStyle.gray)
+        back.callback = self._back
+        self.add_item(back)
+
+    async def _toggle_ban(self, interaction: discord.Interaction) -> None:
+        async with self.bot.dbs.bans.execute(
+            "SELECT 1 FROM bans WHERE uid = ?", (self.target_id,)
+        ) as cur:
+            currently_banned = bool(await cur.fetchone())
+
+        if currently_banned:
+            await self.bot.dbs.bans.execute(
+                "DELETE FROM bans WHERE uid = ?", (self.target_id,)
+            )
+            await self.bot.dbs.bans.commit()
+            await interaction.response.send_message(
+                f"✅ User `{self.target_id}` has been **unbanned**.", ephemeral=True
+            )
+            self.is_banned = False
+            self._build()
+            await interaction.edit_original_response(view=self)
+        else:
+            await interaction.response.send_modal(
+                BanReasonModal(self.bot, self.target_id, self)
+            )
+
+    async def _back(self, interaction: discord.Interaction) -> None:
+        await interaction.response.edit_message(view=self.back_view)
+
+
+class PlayerManagementView(discord.ui.View):
+    def __init__(self, bot, target_id: int) -> None:
+        super().__init__(timeout=60)
+        self.bot = bot
+        self.target_id = target_id
+
+    @discord.ui.button(label="💰 Set Balance", style=discord.ButtonStyle.secondary)
+    async def set_balance(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        await interaction.response.send_modal(SetBalanceModal(self.bot, self.target_id))
+
+    @discord.ui.button(label="🛡️ Security", style=discord.ButtonStyle.danger)
+    async def security(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        async with self.bot.dbs.bans.execute(
+            "SELECT 1 FROM bans WHERE uid = ?", (self.target_id,)
+        ) as cur:
+            is_banned = bool(await cur.fetchone())
+        view = SecurityView(self.bot, self.target_id, is_banned, back_view=self)
+        await interaction.response.edit_message(
+            content="### 🛡️ Security Management", view=view
+        )
+
+    @discord.ui.button(label="🗑️ Remove User", style=discord.ButtonStyle.danger)
+    async def remove_user(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        await self.bot.dbs.players.execute(
+            "DELETE FROM players WHERE uid = ?", (self.target_id,)
+        )
+        await self.bot.dbs.players.commit()
+        self.bot.accepted_cache.discard(self.target_id)
+        await interaction.response.edit_message(
+            content=f"✅ Player `{self.target_id}` has been permanently removed.",
+            embed=None,
+            view=None,
+        )
+
+
+# ── Core search function ──────────────────────────────────────────────────────
+
+async def execute_player_search(ctx, uid: int) -> None:
+    """Build and send a full player intelligence report."""
+    bot = ctx.bot
+
+    # Fetch player record
+    async with bot.dbs.players.execute(
+        """SELECT balance, accepted, total_games, total_wins, total_losses,
+                  total_wagered, total_profit, joined_bot
+           FROM players WHERE uid = ?""",
+        (uid,),
+    ) as cur:
+        row = await cur.fetchone()
+
+    async def send(content=None, embed=None, view=None, ephemeral=True):
+        if ctx.interaction:
+            if not ctx.interaction.response.is_done():
+                await ctx.interaction.response.send_message(
+                    content=content, embed=embed, view=view, ephemeral=ephemeral
+                )
+            else:
+                await ctx.interaction.followup.send(
+                    content=content, embed=embed, view=view, ephemeral=ephemeral
+                )
+        else:
+            await ctx.send(content=content, embed=embed, view=view)
 
     if not row:
-        msg = f"❓ No database record for: `{uid}`"
-        return await ctx.interaction.response.send_message(msg, ephemeral=True) if ctx.interaction else await ctx.send(msg)
+        return await send(content=f"❓ No database record found for UID `{uid}`.")
 
-    balance, accepted = row
-    
+    balance, accepted, games, wins, losses, wagered, profit, joined_bot = row
+
+    # Discord identity
     try:
-        user = ctx.bot.get_user(uid) or await ctx.bot.fetch_user(uid)
-        username = f"{user.name}"
-        avatar = user.display_avatar.url
-        joined_discord = discord.utils.format_dt(user.created_at, style="R")
+        user = bot.get_user(uid) or await bot.fetch_user(uid)
+        username  = str(user)
+        avatar    = user.display_avatar.url
+        discord_created = discord.utils.format_dt(user.created_at, style="R")
     except discord.NotFound:
-        username = "Unknown User"
-        avatar = None
-        joined_discord = "Unknown"
+        username  = f"Unknown User ({uid})"
+        avatar    = None
+        discord_created = "Unknown"
 
-    mutual_count = len([g for g in ctx.bot.guilds if g.get_member(uid)])
+    # Mutual servers
+    mutual_count = sum(1 for g in bot.guilds if g.get_member(uid))
 
-    embed = discord.Embed(title="🔍 Player Intelligence Report", color=discord.Color.blue())
-    if avatar: embed.set_thumbnail(url=avatar)
-    embed.add_field(name="Identity", value=f"**User:** {username}\n**ID:** `{uid}`", inline=False)
-    embed.add_field(name="Economy", value=f"**Balance:** 🪙 `{balance:,}`\n**Verified:** {'✅' if accepted else '<:emoji_26:1504070583145594942>'}", inline=True)
-    embed.add_field(name="Social", value=f"**Mutual Servers:** `{mutual_count}`\n**Joined Discord:** {joined_discord}", inline=True)
+    # Ban status
+    async with bot.dbs.bans.execute(
+        "SELECT reason, banned_by, banned_at FROM bans WHERE uid = ?", (uid,)
+    ) as cur:
+        ban_row = await cur.fetchone()
 
-    view = PlayerManagementView(uid, ctx.bot)
-    
-    if ctx.interaction:
-        await ctx.interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+    # Pending appeal
+    async with bot.dbs.bans.execute(
+        "SELECT 1 FROM ban_appeals WHERE uid = ? AND status='pending'", (uid,)
+    ) as cur:
+        has_appeal = bool(await cur.fetchone())
+
+    # Win rate
+    wr = win_rate(wins, games)
+
+    # Today's activity
+    today = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+    async with bot.dbs.economy.execute(
+        "SELECT COUNT(*), COALESCE(SUM(profit),0) FROM transactions WHERE uid = ? AND DATE(timestamp) = ?",
+        (uid, today),
+    ) as cur:
+        today_row = await cur.fetchone()
+    d_games, d_profit = today_row[0], today_row[1]
+
+    # Leaderboard rank by balance
+    async with bot.dbs.players.execute(
+        "SELECT COUNT(*) FROM players WHERE balance > ? AND accepted = 1", (balance,)
+    ) as cur:
+        rank_row = await cur.fetchone()
+    rank = (rank_row[0] + 1) if rank_row else "?"
+
+    # Build embed
+    status_line = "⛔ **BANNED**" if ban_row else ("✅ Verified" if accepted else "❌ Unverified")
+    profit_color = discord.Color.green() if profit >= 0 else discord.Color.red()
+
+    embed = discord.Embed(
+        title="🔍 Player Intelligence Report",
+        color=profit_color,
+        timestamp=datetime.datetime.now(datetime.timezone.utc),
+    )
+    if avatar:
+        embed.set_thumbnail(url=avatar)
+
+    embed.add_field(
+        name="👤 Identity",
+        value=(
+            f"Username: **{username}**\n"
+            f"ID: `{uid}`\n"
+            f"Status: {status_line}\n"
+            f"Discord Age: {discord_created}"
+        ),
+        inline=False,
+    )
+
+    if joined_bot:
+        try:
+            dt = datetime.datetime.fromisoformat(joined_bot)
+            bot_join = discord.utils.format_dt(dt, style="D")
+        except ValueError:
+            bot_join = joined_bot
     else:
-        await ctx.send(embed=embed, view=view)
+        bot_join = "Not registered"
+
+    embed.add_field(
+        name="💰 Economy",
+        value=(
+            f"Balance: `🪙 {balance:,}`\n"
+            f"Net Profit: `{fmt_signed(profit)}`\n"
+            f"Total Wagered: `🪙 {wagered:,}`\n"
+            f"LB Rank: `#{rank}`"
+        ),
+        inline=True,
+    )
+    embed.add_field(
+        name="🎮 Game Stats",
+        value=(
+            f"Games: `{games:,}`\n"
+            f"Wins / Losses: `{wins:,}` / `{losses:,}`\n"
+            f"Win Rate: `{wr:.1f}%`\n"
+            f"Bot Join: {bot_join}"
+        ),
+        inline=True,
+    )
+    embed.add_field(
+        name="🌐 Social",
+        value=(
+            f"Mutual Servers: `{mutual_count}`\n"
+            f"Today's Games: `{d_games}`\n"
+            f"Today's P&L: `{fmt_signed(d_profit)}`"
+        ),
+        inline=True,
+    )
+
+    if ban_row:
+        ban_reason, banned_by, banned_at = ban_row
+        try:
+            dt = datetime.datetime.fromisoformat(banned_at)
+            ban_time = discord.utils.format_dt(dt, style="R")
+        except ValueError:
+            ban_time = banned_at
+        embed.add_field(
+            name="⛔ Ban Info",
+            value=(
+                f"Reason: {ban_reason}\n"
+                f"Banned By: `{banned_by}`\n"
+                f"When: {ban_time}\n"
+                f"Pending Appeal: `{'Yes' if has_appeal else 'No'}`"
+            ),
+            inline=False,
+        )
+
+    embed.set_footer(text=f"Searched by {ctx.author}")
+
+    view = PlayerManagementView(bot, uid)
+    await send(embed=embed, view=view)

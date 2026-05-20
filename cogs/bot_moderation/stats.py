@@ -1,56 +1,95 @@
-import discord
-import time
+from __future__ import annotations
+
 import datetime
+import time
+import discord
 
-async def execute_stats(ctx):
-    # 1. Database Latency
-    start_db = time.perf_counter()
-    async with ctx.bot.db.execute("SELECT 1") as cursor:
-        await cursor.fetchone()
-    db_latency = round((time.perf_counter() - start_db) * 1000, 2)
 
-    # 2. API Latency & Latency
-    api_latency = round(ctx.bot.latency * 1000, 2)
-
-    # 3. Response Time Calculation
-    if hasattr(ctx, "interaction") and ctx.interaction:
-        start_time = ctx.interaction.created_at
-    else:
-        start_time = ctx.message.created_at if ctx.message else datetime.datetime.now(datetime.timezone.utc)
-    
+async def execute_stats(ctx) -> None:
+    """Render a detailed bot diagnostics embed."""
+    bot = ctx.bot
     now = datetime.datetime.now(datetime.timezone.utc)
-    resp_time = round((now - start_time).total_seconds() * 1000, 2)
 
-    # 4. Uptime Calculation
-    delta = now - ctx.bot.start_time
-    hours, remainder = divmod(int(delta.total_seconds()), 3600)
-    minutes, seconds = divmod(remainder, 60)
-    days, hours = divmod(hours, 24)
+    # DB latency
+    t0 = time.perf_counter()
+    async with bot.dbs.players.execute("SELECT 1") as cur:
+        await cur.fetchone()
+    db_ms = round((time.perf_counter() - t0) * 1000, 2)
 
-    # 5. Accurate Counts
-    server_count = len(ctx.bot.guilds)
-    member_count = sum(g.member_count for g in ctx.bot.guilds if g.member_count)
-    
-    # Querying the database for users who have accepted the rules
-    async with ctx.bot.db.execute("SELECT COUNT(*) FROM players") as cursor:
-        row = await cursor.fetchone()
-        user_count = row[0] if row else 0
+    # API / WS latency
+    api_ms = round(bot.latency * 1000, 2)
 
-    stats_msg = (
-        f"> API Latency : `{api_latency}ms`\n"
-        f"> Database Latency : `{db_latency}ms`\n"
-        f"> Response Time : `{resp_time}ms`\n"
-        f"> Latency : `{api_latency}ms`\n"
-        f"> Status : `Online`\n"
-        f"> Ratelimited : `No`\n"
-        f"> Uptime : `{days}d, {hours}h, {minutes}m`\n"
-        f"> Servers : `{server_count}`\n"
-        f"> Members : `{member_count}`\n"
-        f"> User count : `{user_count}`"
-    )
-    
+    # Response time
     if hasattr(ctx, "interaction") and ctx.interaction:
-        # Ensuring the owner-only stats are sent as a standard response or ephemeral as needed
-        await ctx.interaction.response.send_message(stats_msg, ephemeral=False)
+        created = ctx.interaction.created_at
     else:
-        await ctx.send(stats_msg)
+        created = getattr(ctx.message, "created_at", now)
+    resp_ms = round((now - created).total_seconds() * 1000, 2)
+
+    # Uptime
+    delta = now - bot.start_time
+    days, rem  = divmod(int(delta.total_seconds()), 86400)
+    hours, rem = divmod(rem, 3600)
+    mins, secs = divmod(rem, 60)
+    uptime_str = f"{days}d {hours}h {mins}m {secs}s"
+
+    # Counts
+    guild_count  = len(bot.guilds)
+    member_count = sum(g.member_count or 0 for g in bot.guilds)
+
+    async with bot.dbs.players.execute("SELECT COUNT(*) FROM players WHERE accepted=1") as cur:
+        verified_count = (await cur.fetchone())[0]
+
+    async with bot.dbs.players.execute("SELECT COUNT(*) FROM players") as cur:
+        total_players = (await cur.fetchone())[0]
+
+    async with bot.dbs.bans.execute("SELECT COUNT(*) FROM bans") as cur:
+        ban_count = (await cur.fetchone())[0]
+
+    async with bot.dbs.economy.execute("SELECT COUNT(*), COALESCE(SUM(bet),0) FROM transactions") as cur:
+        tx_row = await cur.fetchone()
+    tx_count  = tx_row[0]
+    tx_wagered = tx_row[1]
+
+    embed = discord.Embed(
+        title="📡 Goldie System Diagnostics",
+        color=discord.Color.gold(),
+        timestamp=now,
+    )
+    embed.add_field(
+        name="⚡ Performance",
+        value=(
+            f"API Latency : `{api_ms} ms`\n"
+            f"DB Latency  : `{db_ms} ms`\n"
+            f"Resp Time   : `{resp_ms} ms`\n"
+            f"Status      : `🟢 Online`"
+        ),
+        inline=True,
+    )
+    embed.add_field(
+        name="🌐 Network",
+        value=(
+            f"Servers : `{guild_count}`\n"
+            f"Members : `{member_count:,}`\n"
+            f"Uptime  : `{uptime_str}`\n"
+            f"Shard   : `{bot.shard_id or 0}`"
+        ),
+        inline=True,
+    )
+    embed.add_field(
+        name="🗄️ Database",
+        value=(
+            f"Total Players  : `{total_players:,}`\n"
+            f"Verified       : `{verified_count:,}`\n"
+            f"Active Bans    : `{ban_count}`\n"
+            f"Transactions   : `{tx_count:,}`\n"
+            f"Total Wagered  : `🪙 {tx_wagered:,}`"
+        ),
+        inline=False,
+    )
+    embed.set_footer(text=f"Requested by {ctx.author}")
+
+    if hasattr(ctx, "interaction") and ctx.interaction:
+        await ctx.interaction.response.send_message(embed=embed, ephemeral=True)
+    else:
+        await ctx.send(embed=embed)
