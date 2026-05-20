@@ -48,7 +48,6 @@ class RulesView(discord.ui.View):
             (uid, username, starter, now),
         )
         await bot.dbs.players.commit()
-
         bot.accepted_cache.add(uid)
 
         try:
@@ -62,10 +61,10 @@ class RulesView(discord.ui.View):
         )
 
 
-# ── Gate functions ────────────────────────────────────────────────────────────
+# ── Gate functions ─────────────────────────────────────────────────────────────
 
 async def ban_gate(ctx) -> Optional[bool]:
-    """Gate 0 — Block users in the bans table."""
+    """Gate 0 — Block users listed in the bans table."""
     async with ctx.bot.dbs.bans.execute(
         "SELECT reason FROM bans WHERE uid = ?", (ctx.author.id,)
     ) as cur:
@@ -91,7 +90,8 @@ async def ban_gate(ctx) -> Optional[bool]:
 
 
 async def channel_gate(ctx) -> Optional[bool]:
-    """Gate 1 — Ensure the command is in an authorised channel."""
+    """Gate 1 — Ensure the command is used in an authorised channel."""
+    # Check if this guild has any channels configured at all
     async with ctx.bot.dbs.logs.execute(
         "SELECT 1 FROM channel_logs WHERE guild_id = ?", (ctx.guild.id,)
     ) as cur:
@@ -104,16 +104,18 @@ async def channel_gate(ctx) -> Optional[bool]:
                 await ctx.invoke(cmd)
         else:
             await ctx.send(
-                "⚙️ **Setup Required** — Ask an administrator to run `go setup_channel`.",
-                delete_after=10,
+                "⚙️ **Setup Required** — Ask a server administrator to run `go setup_channel`.",
+                delete_after=12,
             )
         return False
 
+    # Check if the specific channel is authorised
     async with ctx.bot.dbs.logs.execute(
         "SELECT 1 FROM channel_logs WHERE guild_id = ? AND channel_id = ?",
         (ctx.guild.id, ctx.channel.id),
     ) as cur:
         if not await cur.fetchone():
+            # Silent ignore in wrong channels — this is intentional
             return False
 
     return None
@@ -146,6 +148,13 @@ async def check_user_access(ctx) -> bool:
     """Applied to every prefix command via bot.add_check()."""
     if ctx.author.bot:
         return True
+
+    # DMs — most commands need a guild context, block gracefully
+    if ctx.guild is None:
+        await ctx.send(
+            "❌ Goldie commands must be used inside a server.", delete_after=10
+        )
+        return False
 
     # Bot owner bypasses all gates
     if await ctx.bot.is_owner(ctx.author):

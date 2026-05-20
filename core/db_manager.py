@@ -32,18 +32,20 @@ class DatabaseManager:
         await self._configure_all()
         await self._create_tables()
 
-    async def migrate_legacy(self, path: str = "database.db") -> None:
-        """One-time migration from the original single database.db."""
+    async def migrate_legacy(self) -> None:
+        """One-time migration from the original databases. Safe to call every boot."""
+        await self._migrate_players_db()
+        await self._migrate_channel_logs()
+
+    async def _migrate_players_db(self, path: str = "database.db") -> None:
         if not os.path.exists(path):
             return
-
-        print("🔄  Legacy database.db detected — migrating data …")
+        print("🔄  Legacy database.db detected — migrating players & bans …")
         try:
             old = await aiosqlite.connect(path)
 
             async with old.execute("SELECT uid, accepted, balance FROM players") as cur:
                 player_rows = await cur.fetchall()
-
             for uid, accepted, balance in player_rows:
                 await self.players.execute(
                     "INSERT OR IGNORE INTO players (uid, balance, accepted) VALUES (?, ?, ?)",
@@ -51,21 +53,42 @@ class DatabaseManager:
                 )
             await self.players.commit()
 
-            async with old.execute("SELECT uid FROM players_ban") as cur:
-                ban_rows = await cur.fetchall()
-
-            now = datetime.datetime.now(datetime.timezone.utc).isoformat()
-            for (uid,) in ban_rows:
-                await self.bans.execute(
-                    "INSERT OR IGNORE INTO bans (uid, reason, banned_at) VALUES (?, ?, ?)",
-                    (uid, "Migrated from legacy database", now),
-                )
-            await self.bans.commit()
+            try:
+                async with old.execute("SELECT uid FROM players_ban") as cur:
+                    ban_rows = await cur.fetchall()
+                now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                for (uid,) in ban_rows:
+                    await self.bans.execute(
+                        "INSERT OR IGNORE INTO bans (uid, reason, banned_at) VALUES (?, ?, ?)",
+                        (uid, "Migrated from legacy database", now),
+                    )
+                await self.bans.commit()
+            except Exception:
+                ban_rows = []
 
             await old.close()
-            print(f"✅  Migrated {len(player_rows)} players and {len(ban_rows)} bans.")
+            print(f"✅  Migrated {len(player_rows)} players, {len(ban_rows)} bans.")
         except Exception as exc:
-            print(f"⚠️   Migration warning: {exc}")
+            print(f"⚠️   Players migration warning: {exc}")
+
+    async def _migrate_channel_logs(self, path: str = "log/setup_config.db") -> None:
+        if not os.path.exists(path):
+            return
+        print("🔄  Legacy setup_config.db detected — migrating channel config …")
+        try:
+            old = await aiosqlite.connect(path)
+            async with old.execute("SELECT guild_id, channel_id FROM channel_logs") as cur:
+                rows = await cur.fetchall()
+            for guild_id, channel_id in rows:
+                await self.logs.execute(
+                    "INSERT OR IGNORE INTO channel_logs (guild_id, channel_id) VALUES (?, ?)",
+                    (guild_id, channel_id),
+                )
+            await self.logs.commit()
+            await old.close()
+            print(f"✅  Migrated {len(rows)} channel log entries.")
+        except Exception as exc:
+            print(f"⚠️   Channel logs migration warning: {exc}")
 
     async def close(self) -> None:
         for db in (self.players, self.bans, self.economy, self.logs):

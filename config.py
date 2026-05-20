@@ -7,7 +7,7 @@ load_dotenv()
 class Config:
     TOKEN: str = os.getenv("TOKEN", "")
     PG_DSN: str = os.getenv("PG_DSN", "")
-    PREFIX: str = os.getenv("BOT_PREFIX", " go ")
+    PREFIX: str = os.getenv("BOT_PREFIX", "go ")
 
     COGS_DIR: str = "./cogs"
     DATA_DIR: str = "./data"
